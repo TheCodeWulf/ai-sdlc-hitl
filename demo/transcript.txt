@@ -1,0 +1,22 @@
+Microsoft Teams — Meeting transcript
+Meeting: "Rec Dashboard — FX break tolerance working session"
+Date: 2026-08-03
+
+[00:00:14] Priya (Product Owner): Thanks all. Quick one — ops flagged that managers are drowning in tiny FX breaks on the reconciliation queue. Let's scope a fix.
+[00:00:29] Omkar (Ops Lead): Right. Every valuation date we reconcile the manager's book against the custodian statement. Loads of the breaks are just sub-dollar FX rounding — not worth chasing — but they still clutter the queue.
+[00:00:47] Dana (Dev Lead): So we already have a global tolerance in the engine. What's missing?
+[00:00:53] Omkar: It's one flat number for every currency. A 2-unit break in JPY is noise; the same in USD might be real. We need the tolerance to be configurable per currency.
+[00:01:08] Priya: Okay — per-currency tolerance. And when a break is above tolerance?
+[00:01:14] Omkar: Then it's material — alert the manager in the dashboard so someone actually looks at it. Right now nothing gets pushed; it just sits.
+[00:01:27] Ravi (Risk): Two hard requirements. One, it must be auditable — who set each tolerance and when. Two, absolutely no auto-resolving of breaks. The system can flag and alert, but a human confirms every clear. That's a control we cannot lose.
+[00:01:45] Dana: Understood. So: per-currency tolerance table, suppress breaks within tolerance, alert on breaks above tolerance, and an append-only audit of tolerance changes.
+[00:01:58] Priya: Do we touch NAV at all?
+[00:02:03] Ravi: No. This is reconciliation only. NAV production is out of scope — don't go near the valuation calc.
+[00:02:12] Omkar: And phase it — read-only alerting first. No auto-actions on the book. We prove the alerting, then talk about workflow later.
+[00:02:25] Dana: What about a break present in only one source — missing position?
+[00:02:31] Omkar: Keep today's behaviour — that's always a break regardless of tolerance. Tolerance only applies to quantity and market-value differences.
+[00:02:42] Priya: Currencies to support day one?
+[00:02:46] Omkar: USD, EUR, JPY at least. Default tolerance for anything not in the table, so nothing slips through untriaged.
+[00:02:58] Ravi: One open item — who's allowed to *set* the tolerances? Ops or the manager? Flag that; we'll confirm with governance.
+[00:03:10] Priya: Good. Enough to draft the story. I'll get it into the backlog. Thanks all.
+[00:03:16] Dana: Thanks — I'll prep the repo.
