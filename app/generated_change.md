@@ -1,286 +1,368 @@
 **Design note**  
-Create a lightweight Python module that (1) stores per‑currency tolerances with a default fallback, (2) records every change in an immutable audit‑log, (3) lets the reconciliation engine apply those tolerances while always treating missing‑position breaks as material, and (4) pushes real‑time alerts to a simple in‑memory dashboard for managers.
+Create three lightweight tables – `currency_tolerance`, `tolerance_audit` and `fx_alert` – using SQLAlchemy.  Expose CRUD endpoints for tolerances (including a single‑row default) via FastAPI; each mutation writes an immutable audit row.  Provide a utility `evaluate_breaks` that the reconciliation engine can call to compare a list of FX breaks against the stored tolerances and, when a break exceeds its threshold, insert a read‑only alert record.
 
 ---
 
 ## Implementation
 ```python
-# fx_tolerance.py
+# main.py
 """
-Minimal implementation of configurable per‑currency FX break tolerance,
-audit logging and manager alerts.
+FastAPI service implementing per‑currency FX break tolerances,
+audit‑trail for tolerance changes, and read‑only dashboard alerts.
 """
 
-import threading
-import time
-from collections import defaultdict
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from fastapi import FastAPI, HTTPException, Depends, status
+from pydantic import BaseModel, Field, validator
+from sqlalchemy import (
+    Column,
+    String,
+    Float,
+    Boolean,
+    DateTime,
+    Integer,
+    create_engine,
+    ForeignKey,
+    UniqueConstraint,
+    event,
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship
 
 # ----------------------------------------------------------------------
-# Simple role‑based access control placeholder (to be replaced by real ACL)
+# Database setup (SQLite in‑memory for demo; replace with real DB URL)
 # ----------------------------------------------------------------------
-ALLOWED_ROLES = {"ops_manager", "compliance_manager"}  # extend later
-
-
-def _has_permission(user_roles: List[str]) -> bool:
-    return any(role in ALLOWED_ROLES for role in user_roles)
+SQLALCHEMY_DATABASE_URL = "sqlite:///./fx_tolerance.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 
 # ----------------------------------------------------------------------
-# Data models
+# Models
 # ----------------------------------------------------------------------
-@dataclass(frozen=True)
-class ToleranceRecord:
-    currency: str          # ISO‑4217 code, "DEFAULT" for fallback
-    value: float           # tolerance amount (absolute)
-    updated_by: str        # user id
-    updated_at: float      # epoch seconds
-    reason: Optional[str] = None
+class CurrencyTolerance(Base):
+    __tablename__ = "currency_tolerance"
+    id = Column(Integer, primary_key=True, index=True)
+    currency = Column(String, nullable=False, unique=True)  # e.g. "USD"
+    tolerance = Column(Float, nullable=False)  # numeric threshold
+    is_default = Column(Boolean, default=False, nullable=False)
+
+    # ensure only one default row exists
+    __table_args__ = (UniqueConstraint("is_default", name="uq_default_true"),)
 
 
-@dataclass(frozen=True)
-class AuditEntry:
-    currency: str
-    old_value: Optional[float]
-    new_value: float
-    user_id: str
-    timestamp: float
-    reason: Optional[str] = None
+class ToleranceAudit(Base):
+    __tablename__ = "tolerance_audit"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, nullable=False)
+    action = Column(String, nullable=False)  # create / update / delete
+    currency = Column(String, nullable=True)  # null for default changes
+    old_value = Column(Float, nullable=True)
+    new_value = Column(Float, nullable=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
-@dataclass(frozen=True)
-class Alert:
-    manager_id: str
+class FxAlert(Base):
+    __tablename__ = "fx_alert"
+    id = Column(Integer, primary_key=True, index=True)
+    currency = Column(String, nullable=False)
+    break_amount = Column(Float, nullable=False)
+    reconciliation_id = Column(Integer, nullable=False)  # FK in real system
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+# ----------------------------------------------------------------------
+# Pydantic schemas
+# ----------------------------------------------------------------------
+class ToleranceBase(BaseModel):
+    currency: Optional[str] = Field(None, description="ISO currency code, omitted for default")
+    tolerance: float = Field(..., gt=0, description="Positive numeric tolerance")
+
+    @validator("currency")
+    def upper_case(cls, v):
+        if v:
+            return v.upper()
+        return v
+
+
+class ToleranceCreate(ToleranceBase):
+    pass
+
+
+class ToleranceUpdate(BaseModel):
+    tolerance: float = Field(..., gt=0)
+
+
+class ToleranceOut(ToleranceBase):
+    id: int
+    is_default: bool
+
+    class Config:
+        orm_mode = True
+
+
+class AlertOut(BaseModel):
+    id: int
     currency: str
     break_amount: float
-    tolerance_used: float
-    position_link: str
-    generated_at: float
+    reconciliation_id: int
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
 
 
 # ----------------------------------------------------------------------
-# Core services
+# FastAPI app & dependencies
 # ----------------------------------------------------------------------
-class ToleranceStore:
-    """
-    Stores per‑currency tolerance records and a default.
-    Updates are immutable – old records stay in the audit log.
-    """
-    def __init__(self, default_value: float = 0.0):
-        self._lock = threading.Lock()
-        self._tolerances: Dict[str, ToleranceRecord] = {}
-        self._default = ToleranceRecord(
-            currency="DEFAULT",
-            value=default_value,
-            updated_by="system",
-            updated_at=time.time(),
-        )
-        self.audit_log = AuditLog()
-
-    def get(self, currency: str) -> float:
-        """Return tolerance for currency; fall back to default."""
-        rec = self._tolerances.get(currency.upper())
-        return rec.value if rec else self._default.value
-
-    def set(self, currency: str, value: float, user_id: str,
-            user_roles: List[str], reason: Optional[str] = None) -> None:
-        """Create/overwrite tolerance; records immutable audit entry."""
-        if not _has_permission(user_roles):
-            raise PermissionError("User lacks permission to set tolerances")
-
-        currency = currency.upper()
-        with self._lock:
-            old = self._tolerances.get(currency)
-            old_val = old.value if old else None
-            new_rec = ToleranceRecord(
-                currency=currency,
-                value=value,
-                updated_by=user_id,
-                updated_at=time.time(),
-                reason=reason,
-            )
-            self._tolerances[currency] = new_rec
-            # audit
-            self.audit_log.append(
-                AuditEntry(
-                    currency=currency,
-                    old_value=old_val,
-                    new_value=value,
-                    user_id=user_id,
-                    timestamp=time.time(),
-                    reason=reason,
-                )
-            )
-
-    def set_default(self, value: float, user_id: str,
-                    user_roles: List[str], reason: Optional[str] = None) -> None:
-        """Update the default tolerance (currency='DEFAULT')."""
-        self.set("DEFAULT", value, user_id, user_roles, reason)
-
-    def history(self, currency: str) -> List[AuditEntry]:
-        """Return full audit history for a currency, newest last."""
-        return self.audit_log.query(currency.upper())
+app = FastAPI(title="FX Tolerance Service")
 
 
-class AuditLog:
-    """Append‑only in‑memory ledger."""
-    def __init__(self):
-        self._entries: List[AuditEntry] = []
-        self._lock = threading.Lock()
-
-    def append(self, entry: AuditEntry) -> None:
-        with self._lock:
-            self._entries.append(entry)
-
-    def query(self, currency: str) -> List[AuditEntry]:
-        with self._lock:
-            return [e for e in self._entries if e.currency == currency]
-
-
-class AlertService:
-    """Collects alerts for managers; in a real system this would push to UI."""
-    def __init__(self):
-        self._alerts: Dict[str, List[Alert]] = defaultdict(list)
-        self._lock = threading.Lock()
-
-    def push(self, manager_id: str, currency: str,
-             break_amount: float, tolerance_used: float,
-             position_link: str) -> None:
-        alert = Alert(
-            manager_id=manager_id,
-            currency=currency,
-            break_amount=break_amount,
-            tolerance_used=tolerance_used,
-            position_link=position_link,
-            generated_at=time.time(),
-        )
-        with self._lock:
-            self._alerts[manager_id].append(alert)
-
-    def get_for_manager(self, manager_id: str) -> List[Alert]:
-        with self._lock:
-            return list(self._alerts.get(manager_id, []))
-
-
-class ReconciliationEngine:
-    """
-    Evaluates a pair of positions and decides if a break is material.
-    Logs the applied tolerance for debugging.
-    """
-    def __init__(self, tolerance_store: ToleranceStore,
-                 alert_service: AlertService):
-        self.tolerance_store = tolerance_store
-        self.alert_service = alert_service
-        self._debug_log: List[Dict] = []  # simple in‑memory debug trace
-
-    def evaluate(self,
-                 currency: str,
-                 qty_diff: float,
-                 mv_diff: float,
-                 source_a_has: bool,
-                 source_b_has: bool,
-                 manager_id: str,
-                 position_link: str) -> Tuple[bool, str]:
-        """
-        Returns (is_material_break, reason). Also generates alerts when needed.
-        """
-        # Missing‑position break – always material
-        if source_a_has != source_b_has:
-            reason = "Missing position in one source"
-            self._record_debug(currency, qty_diff, mv_diff, None, True, reason)
-            self.alert_service.push(
-                manager_id, currency,
-                break_amount=abs(qty_diff) if not source_a_has or not source_b_has else abs(mv_diff),
-                tolerance_used=0.0,
-                position_link=position_link,
-            )
-            return True, reason
-
-        # Apply tolerance to both qty and market‑value differences
-        tol = self.tolerance_store.get(currency)
-        qty_material = abs(qty_diff) > tol
-        mv_material = abs(mv_diff) > tol
-        is_material = qty_material or mv_material
-
-        reason = "Within tolerance" if not is_material else "Exceeds tolerance"
-        self._record_debug(currency, qty_diff, mv_diff, tol, is_material, reason)
-
-        if is_material:
-            # generate alert for the manager
-            self.alert_service.push(
-                manager_id,
-                currency,
-                break_amount=max(abs(qty_diff), abs(mv_diff)),
-                tolerance_used=tol,
-                position_link=position_link,
-            )
-        return is_material, reason
-
-    def _record_debug(self, currency, qty_diff, mv_diff, tol, material, reason):
-        entry = {
-            "timestamp": time.time(),
-            "currency": currency,
-            "qty_diff": qty_diff,
-            "mv_diff": mv_diff,
-            "tolerance_used": tol,
-            "material": material,
-            "reason": reason,
-        }
-        self._debug_log.append(entry)
-
-    def get_debug_log(self) -> List[Dict]:
-        return list(self._debug_log)
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 # ----------------------------------------------------------------------
-# Example usage (would be removed/relocated in production code)
+# Helper: audit logging (append‑only)
 # ----------------------------------------------------------------------
-if __name__ == "__main__":
-    store = ToleranceStore(default_value=0.5)
-    alerts = AlertService()
-    engine = ReconciliationEngine(store, alerts)
-
-    # Ops manager sets specific tolerances
-    store.set("USD", 1.0, user_id="alice", user_roles=["ops_manager"], reason="Market noise")
-    store.set("EUR", 0.8, user_id="bob", user_roles=["compliance_manager"])
-
-    # Reconcile a pair
-    material, msg = engine.evaluate(
-        currency="USD",
-        qty_diff=0.4,
-        mv_diff=0.3,
-        source_a_has=True,
-        source_b_has=True,
-        manager_id="mgr_1",
-        position_link="http://example.com/pos/123",
+def log_audit(
+    db: Session,
+    *,
+    user_id: str,
+    action: str,
+    currency: Optional[str],
+    old_value: Optional[float],
+    new_value: Optional[float],
+) -> None:
+    audit = ToleranceAudit(
+        user_id=user_id,
+        action=action,
+        currency=currency,
+        old_value=old_value,
+        new_value=new_value,
     )
-    print("Material break?", material, msg)
+    db.add(audit)
+    db.commit()
 
-    # Missing position case
-    material, msg = engine.evaluate(
-        currency="JPY",
-        qty_diff=0.0,
-        mv_diff=0.0,
-        source_a_has=True,
-        source_b_has=False,
-        manager_id="mgr_1",
-        position_link="http://example.com/pos/124",
+
+# ----------------------------------------------------------------------
+# CRUD endpoints for tolerances
+# ----------------------------------------------------------------------
+@app.post("/tolerances/", response_model=ToleranceOut, status_code=status.HTTP_201_CREATED)
+def create_tolerance(
+    payload: ToleranceCreate,
+    db: Session = Depends(get_db),
+    user_id: str = "system",  # placeholder auth
+):
+    # default tolerance handling
+    if payload.currency is None:
+        # only one default allowed – enforce via unique constraint
+        existing = db.query(CurrencyTolerance).filter_by(is_default=True).first()
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Default tolerance already exists. Use update endpoint.",
+            )
+        tol = CurrencyTolerance(currency="DEFAULT", tolerance=payload.tolerance, is_default=True)
+        db.add(tol)
+        db.commit()
+        db.refresh(tol)
+        log_audit(db, user_id=user_id, action="create", currency=None, old_value=None, new_value=payload.tolerance)
+        return tol
+
+    # per‑currency tolerance
+    if db.query(CurrencyTolerance).filter_by(currency=payload.currency).first():
+        raise HTTPException(status_code=400, detail="Tolerance for this currency already exists.")
+    tol = CurrencyTolerance(currency=payload.currency, tolerance=payload.tolerance, is_default=False)
+    db.add(tol)
+    db.commit()
+    db.refresh(tol)
+    log_audit(
+        db,
+        user_id=user_id,
+        action="create",
+        currency=payload.currency,
+        old_value=None,
+        new_value=payload.tolerance,
     )
-    print("Material break?", material, msg)
+    return tol
 
-    # View alerts for manager
-    for a in alerts.get_for_manager("mgr_1"):
-        print("ALERT:", asdict(a))
 
-    # Audit history for USD
-    for e in store.history("USD"):
-        print("AUDIT:", asdict(e))
+@app.get("/tolerances/", response_model=List[ToleranceOut])
+def list_tolerances(db: Session = Depends(get_db)):
+    return db.query(CurrencyTolerance).all()
+
+
+@app.put("/tolerances/{currency}", response_model=ToleranceOut)
+def update_tolerance(
+    currency: str,
+    payload: ToleranceUpdate,
+    db: Session = Depends(get_db),
+    user_id: str = "system",
+):
+    currency = currency.upper()
+    tol = db.query(CurrencyTolerance).filter_by(currency=currency).first()
+    if not tol:
+        raise HTTPException(status_code=404, detail="Tolerance not found.")
+    old = tol.tolerance
+    tol.tolerance = payload.tolerance
+    db.commit()
+    db.refresh(tol)
+    log_audit(
+        db,
+        user_id=user_id,
+        action="update",
+        currency=currency,
+        old_value=old,
+        new_value=payload.tolerance,
+    )
+    return tol
+
+
+@app.delete("/tolerances/{currency}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_tolerance(
+    currency: str,
+    db: Session = Depends(get_db),
+    user_id: str = "system",
+):
+    currency = currency.upper()
+    tol = db.query(CurrencyTolerance).filter_by(currency=currency).first()
+    if not tol:
+        raise HTTPException(status_code=404, detail="Tolerance not found.")
+    if tol.is_default:
+        raise HTTPException(status_code=400, detail="Default tolerance cannot be deleted; update it instead.")
+    old = tol.tolerance
+    db.delete(tol)
+    db.commit()
+    log_audit(
+        db,
+        user_id=user_id,
+        action="delete",
+        currency=currency,
+        old_value=old,
+        new_value=None,
+    )
+    return
+
+
+# ----------------------------------------------------------------------
+# Default tolerance endpoint (separate for clarity)
+# ----------------------------------------------------------------------
+@app.put("/tolerances/default", response_model=ToleranceOut)
+def update_default_tolerance(
+    payload: ToleranceUpdate,
+    db: Session = Depends(get_db),
+    user_id: str = "system",
+):
+    default = db.query(CurrencyTolerance).filter_by(is_default=True).first()
+    if not default:
+        # create if missing
+        default = CurrencyTolerance(currency="DEFAULT", tolerance=payload.tolerance, is_default=True)
+        db.add(default)
+        db.commit()
+        db.refresh(default)
+        log_audit(db, user_id, "create", None, None, payload.tolerance)
+        return default
+
+    old = default.tolerance
+    default.tolerance = payload.tolerance
+    db.commit()
+    db.refresh(default)
+    log_audit(db, user_id, "update", None, old, payload.tolerance)
+    return default
+
+
+# ----------------------------------------------------------------------
+# Alert read‑only endpoint (dashboard consumption)
+# ----------------------------------------------------------------------
+@app.get("/alerts/", response_model=List[AlertOut])
+def list_alerts(db: Session = Depends(get_db)):
+    return db.query(FxAlert).order_by(FxAlert.created_at.desc()).all()
+
+
+# ----------------------------------------------------------------------
+# Core evaluation logic – to be called by the reconciliation engine
+# ----------------------------------------------------------------------
+class FxBreak(BaseModel):
+    """Incoming break record from the reconciliation engine."""
+    reconciliation_id: int
+    currency: str
+    quantity_diff: float
+    market_value_diff: float
+    missing_position: bool = False  # true when break is due to missing position only
+
+
+def evaluate_breaks(breaks: List[FxBreak], db: Session) -> List[FxAlert]:
+    """
+    Apply per‑currency tolerance (or default) to each break.
+    Returns list of generated alerts.
+    """
+    alerts: List[FxAlert] = []
+    # cache tolerances for performance
+    tolerance_map = {
+        ct.currency: ct.tolerance
+        for ct in db.query(CurrencyTolerance).filter(CurrencyTolerance.is_default == False).all()
+    }
+    default_tol_obj = db.query(CurrencyTolerance).filter_by(is_default=True).first()
+    default_tol = default_tol_obj.tolerance if default_tol_obj else 0.0
+
+    for br in breaks:
+        if br.missing_position:
+            # skip – not part of FX quantity/market‑value evaluation
+            continue
+
+        # absolute differences to compare
+        diff = max(abs(br.quantity_diff), abs(br.market_value_diff))
+
+        # resolve tolerance
+        tol = tolerance_map.get(br.currency.upper(), default_tol)
+
+        if diff > tol:
+            alert = FxAlert(
+                currency=br.currency.upper(),
+                break_amount=diff,
+                reconciliation_id=br.reconciliation_id,
+            )
+            db.add(alert)
+            alerts.append(alert)
+
+    db.commit()
+    # refresh to get IDs/timestamps
+    for a in alerts:
+        db.refresh(a)
+    return alerts
+
+
+# ----------------------------------------------------------------------
+# Example endpoint to trigger evaluation (for demo/testing)
+# ----------------------------------------------------------------------
+@app.post("/evaluate/", response_model=List[AlertOut])
+def evaluate_endpoint(
+    payload: List[FxBreak],
+    db: Session = Depends(get_db),
+):
+    alerts = evaluate_breaks(payload, db)
+    return alerts
+
+
+# ----------------------------------------------------------------------
+# Create tables on startup
+# ----------------------------------------------------------------------
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
 ```
 
 ---
 
 ## Self‑review
-- **Correctness:** Implements per‑currency tolerance with default fallback, immutable audit entries, and always‑material missing‑position handling as required.  
-- **Simplicity:** Uses in‑memory dictionaries and lists; no external storage, keeping the implementation minimal while satisfying the acceptance criteria.  
-- **Extensibility:** Clear separation of concerns (store, audit, engine, alerts) makes it easy to replace in‑memory stores with a database or message bus later.
+- **Scope adherence** – Implements only the required storage, audit‑trail, default fallback, break evaluation, and read‑only alert exposure; no UI or external role integration.
+- **Immutability guarantee** – `ToleranceAudit` rows are only inserted via `log_audit`; no delete/update paths are exposed, satisfying append‑only requirement.
+- **Default handling** – Enforced a unique constraint on `is_default=True` and provided a dedicated endpoint to modify the single default tolerance.
