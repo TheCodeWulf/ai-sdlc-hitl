@@ -1,236 +1,291 @@
-## Design note
-- Use Flask + SQLAlchemy with a lightweight SQLite DB to store per‑currency tolerances, a single default tolerance, and an immutable audit log.  
-- CRUD endpoints enforce the **ToleranceAdmin** role via a simple request‑header check; all other callers receive read‑only data.  
-- The reconciliation engine is exposed as `/process_breaks`; it applies the configured tolerance (or default) to each break, suppresses material‑level breaks, and marks non‑suppressible missing‑position breaks.
+## Design note  
+Implement a minimal in‑memory service that (1) stores per‑currency FX tolerances with validation and role‑based write access, (2) falls back to a configurable default tolerance, (3) evaluates breaks and produces read‑only alerts for material differences, and (4) records every tolerance change in an immutable audit log searchable by currency, user and date range.
 
 ## Implementation
 ```python
-# app.py
-import os
+# fx_tolerance.py
+"""
+Core implementation for configurable per‑currency FX break tolerances,
+default fallback, dashboard alerts and an immutable audit log.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from flask import Flask, request, jsonify, abort
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import CheckConstraint, desc
-
-app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///fx_tolerance.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-db = SQLAlchemy(app)
+from typing import Dict, List, Optional, Tuple, Iterable
 
 # ----------------------------------------------------------------------
-# Models
+# Configuration & role handling
 # ----------------------------------------------------------------------
-class Tolerance(db.Model):
-    __tablename__ = "tolerances"
-    currency = db.Column(db.String(3), primary_key=True)  # ISO code or 'DEFAULT'
-    value = db.Column(db.Float, nullable=False)
-    __table_args__ = (CheckConstraint("value >= 0", name="ck_positive_value"),)
+ALLOWED_WRITE_ROLES = {"Ops", "Manager"}  # minimal role set for this sprint
+_default_tolerance: float = 0.01  # system‑wide default, can be changed at runtime
 
-class AuditLog(db.Model):
-    __tablename__ = "audit_log"
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    currency = db.Column(db.String(3), nullable=False)
-    old_value = db.Column(db.Float, nullable=True)
-    new_value = db.Column(db.Float, nullable=True)
-    user_id = db.Column(db.String, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    operation = db.Column(db.String, nullable=False)  # CREATE, UPDATE, DELETE
 
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
-def is_admin():
-    return request.headers.get("X-User-Role") == "ToleranceAdmin"
+def set_default_tolerance(value: float) -> None:
+    """Update the global default tolerance (must be non‑negative)."""
+    if not isinstance(value, (int, float)):
+        raise ValueError("Default tolerance must be numeric")
+    if value < 0:
+        raise ValueError("Default tolerance cannot be negative")
+    global _default_tolerance
+    _default_tolerance = float(value)
 
-def current_user():
-    return request.headers.get("X-User-Id", "unknown")
 
-def log_audit(currency, old, new, op):
-    entry = AuditLog(
-        currency=currency,
-        old_value=old,
-        new_value=new,
-        user_id=current_user(),
-        operation=op,
-    )
-    db.session.add(entry)
-    db.session.commit()
+def get_default_tolerance() -> float:
+    """Return the current global default tolerance."""
+    return _default_tolerance
 
-def get_tolerance(currency):
-    tol = Tolerance.query.filter_by(currency=currency).first()
-    if tol:
-        return tol.value
-    # fallback to default
-    default = Tolerance.query.filter_by(currency="DEFAULT").first()
-    return default.value if default else 0.0  # safe default if not set
 
 # ----------------------------------------------------------------------
-# API – Tolerance CRUD
+# Data models
 # ----------------------------------------------------------------------
-@app.route("/tolerances", methods=["GET"])
-def list_tolerances():
-    records = Tolerance.query.all()
-    return jsonify([{"currency": r.currency, "value": r.value} for r in records])
+@dataclass(frozen=True)
+class ToleranceRecord:
+    currency: str
+    tolerance: float
 
-@app.route("/tolerances", methods=["POST"])
-def create_tolerance():
-    if not is_admin():
-        abort(403)
-    data = request.get_json()
-    cur = data.get("currency")
-    val = data.get("value")
-    if not cur or not isinstance(val, (int, float)) or val < 0:
-        abort(400, "Invalid payload")
-    if Tolerance.query.get(cur):
-        abort(400, "Currency already exists")
-    tol = Tolerance(currency=cur, value=val)
-    db.session.add(tol)
-    db.session.commit()
-    log_audit(cur, None, val, "CREATE")
-    return jsonify({"currency": cur, "value": val}), 200
 
-@app.route("/tolerances/<currency>", methods=["PUT"])
-def update_tolerance(currency):
-    if not is_admin():
-        abort(403)
-    data = request.get_json()
-    val = data.get("value")
-    if not isinstance(val, (int, float)) or val < 0:
-        abort(400, "Invalid value")
-    tol = Tolerance.query.get(currency)
-    if not tol:
-        abort(404)
-    old = tol.value
-    tol.value = val
-    db.session.commit()
-    log_audit(currency, old, val, "UPDATE")
-    return jsonify({"currency": currency, "value": val}), 200
+@dataclass(frozen=True)
+class AuditEntry:
+    timestamp: datetime
+    user_id: str
+    role: str
+    operation: str  # "create", "update", "delete"
+    currency: str
+    old_value: Optional[float]
+    new_value: Optional[float]
 
-@app.route("/tolerances/<currency>", methods=["DELETE"])
-def delete_tolerance(currency):
-    if not is_admin():
-        abort(403)
-    tol = Tolerance.query.get(currency)
-    if not tol:
-        abort(404)
-    old = tol.value
-    db.session.delete(tol)
-    db.session.commit()
-    log_audit(currency, old, None, "DELETE")
-    return "", 204
+
+@dataclass(frozen=True)
+class BreakAlert:
+    timestamp: datetime
+    currency: str
+    qty_diff: float
+    mv_diff: float
+    tolerance: float
+    reason: str  # "exceeds_tolerance" or "missing_position"
+
 
 # ----------------------------------------------------------------------
-# API – Default tolerance (treated as a special record)
+# Core stores (in‑memory for this minimal implementation)
 # ----------------------------------------------------------------------
-@app.route("/default_tolerance", methods=["GET"])
-def get_default():
-    default = Tolerance.query.filter_by(currency="DEFAULT").first()
-    val = default.value if default else None
-    return jsonify({"default_tolerance": val})
+class ToleranceStore:
+    """Manages per‑currency tolerance records with validation and audit."""
 
-@app.route("/default_tolerance", methods=["POST"])
-def set_default():
-    if not is_admin():
-        abort(403)
-    data = request.get_json()
-    val = data.get("value")
-    if not isinstance(val, (int, float)) or val < 0:
-        abort(400, "Invalid value")
-    default = Tolerance.query.filter_by(currency="DEFAULT").first()
-    if default:
-        old = default.value
-        default.value = val
-        op = "UPDATE"
-    else:
-        old = None
-        default = Tolerance(currency="DEFAULT", value=val)
-        db.session.add(default)
-        op = "CREATE"
-    db.session.commit()
-    log_audit("DEFAULT", old, val, op)
-    return jsonify({"default_tolerance": val}), 200
+    def __init__(self, audit_log: "AuditLog"):
+        self._store: Dict[str, float] = {}
+        self._audit = audit_log
+
+    def _check_write_permission(self, role: str) -> None:
+        if role not in ALLOWED_WRITE_ROLES:
+            raise PermissionError(f"Role '{role}' not permitted to modify tolerances")
+
+    @staticmethod
+    def _validate_currency(currency: str) -> None:
+        if not isinstance(currency, str) or len(currency) != 3:
+            raise ValueError("Currency must be a 3‑letter ISO code")
+
+    @staticmethod
+    def _validate_tolerance(value: float) -> None:
+        if not isinstance(value, (int, float)):
+            raise ValueError("Tolerance must be numeric")
+        if value < 0:
+            raise ValueError("Tolerance cannot be negative")
+
+    def set_tolerance(self, user_id: str, role: str, currency: str, tolerance: float) -> None:
+        """Create or update a tolerance record."""
+        self._check_write_permission(role)
+        self._validate_currency(currency)
+        self._validate_tolerance(tolerance)
+
+        old = self._store.get(currency)
+        operation = "update" if old is not None else "create"
+        self._store[currency] = float(tolerance)
+
+        self._audit.record(
+            user_id=user_id,
+            role=role,
+            operation=operation,
+            currency=currency,
+            old_value=old,
+            new_value=tolerance,
+        )
+
+    def delete_tolerance(self, user_id: str, role: str, currency: str) -> None:
+        """Remove a tolerance record."""
+        self._check_write_permission(role)
+        self._validate_currency(currency)
+
+        if currency not in self._store:
+            raise KeyError(f"No tolerance defined for currency {currency}")
+
+        old = self._store.pop(currency)
+        self._audit.record(
+            user_id=user_id,
+            role=role,
+            operation="delete",
+            currency=currency,
+            old_value=old,
+            new_value=None,
+        )
+
+    def get_tolerance(self, currency: str) -> float:
+        """Return the configured tolerance or the system default."""
+        return self._store.get(currency.upper(), get_default_tolerance())
+
+
+class AuditLog:
+    """Append‑only, immutable audit log."""
+
+    def __init__(self):
+        self._entries: List[AuditEntry] = []
+
+    def record(
+        self,
+        user_id: str,
+        role: str,
+        operation: str,
+        currency: str,
+        old_value: Optional[float],
+        new_value: Optional[float],
+    ) -> None:
+        entry = AuditEntry(
+            timestamp=datetime.utcnow(),
+            user_id=user_id,
+            role=role,
+            operation=operation,
+            currency=currency.upper(),
+            old_value=old_value,
+            new_value=new_value,
+        )
+        self._entries.append(entry)
+
+    def query(
+        self,
+        currency: Optional[str] = None,
+        user_id: Optional[str] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> List[AuditEntry]:
+        """Searchable by currency, user and date range."""
+        result = self._entries
+        if currency:
+            result = [e for e in result if e.currency == currency.upper()]
+        if user_id:
+            result = [e for e in result if e.user_id == user_id]
+        if start:
+            result = [e for e in result if e.timestamp >= start]
+        if end:
+            result = [e for e in result if e.timestamp <= end]
+        return list(result)
+
+
+class ReconciliationEngine:
+    """Evaluates breaks against tolerances and produces alerts."""
+
+    def __init__(self, tolerance_store: ToleranceStore):
+        self._tolerance_store = tolerance_store
+        self._alerts: List[BreakAlert] = []
+
+    def process_break(
+        self,
+        currency: str,
+        qty_diff: float,
+        mv_diff: float,
+        missing_position: bool = False,
+    ) -> Optional[BreakAlert]:
+        """
+        Evaluate a single break. Returns a BreakAlert if the break is material,
+        otherwise None.
+        """
+        tolerance = self._tolerance_store.get_tolerance(currency)
+
+        # Determine if alert is needed
+        if missing_position:
+            reason = "missing_position"
+            alert_needed = True
+        elif abs(qty_diff) > tolerance or abs(mv_diff) > tolerance:
+            reason = "exceeds_tolerance"
+            alert_needed = True
+        else:
+            alert_needed = False
+
+        if not alert_needed:
+            return None
+
+        alert = BreakAlert(
+            timestamp=datetime.utcnow(),
+            currency=currency.upper(),
+            qty_diff=qty_diff,
+            mv_diff=mv_diff,
+            tolerance=tolerance,
+            reason=reason,
+        )
+        self._alerts.append(alert)
+        return alert
+
+    def get_alerts(self) -> List[BreakAlert]:
+        """Read‑only view of all generated alerts."""
+        return list(self._alerts)
+
 
 # ----------------------------------------------------------------------
-# API – Audit log query (read‑only)
-# ----------------------------------------------------------------------
-@app.route("/audit", methods=["GET"])
-def audit_query():
-    page = int(request.args.get("page", 1))
-    size = int(request.args.get("size", 20))
-    q = AuditLog.query.order_by(desc(AuditLog.timestamp))
-    entries = q.paginate(page=page, per_page=size, error_out=False).items
-    result = [
-        {
-            "currency": e.currency,
-            "old_value": e.old_value,
-            "new_value": e.new_value,
-            "user_id": e.user_id,
-            "timestamp": e.timestamp.isoformat(),
-            "operation": e.operation,
-        }
-        for e in entries
-    ]
-    return jsonify(result)
-
-# ----------------------------------------------------------------------
-# API – Reconciliation break processing (suppression & alert)
-# ----------------------------------------------------------------------
-@app.route("/process_breaks", methods=["POST"])
-def process_breaks():
-    """
-    Expected payload:
-    [
-        {
-            "id": "break1",
-            "currency": "USD",
-            "qty_diff": 10.5,
-            "mv_diff": 2500.0,
-            "missing_position": false   # true if present in only one source
-        },
-        ...
-    ]
-    Returns list of breaks that survive suppression with an `alert` flag.
-    """
-    breaks = request.get_json()
-    if not isinstance(breaks, list):
-        abort(400, "Payload must be a list")
-    output = []
-    for b in breaks:
-        cur = b.get("currency")
-        qty = abs(b.get("qty_diff", 0))
-        mv = abs(b.get("mv_diff", 0))
-        missing = b.get("missing_position", False)
-
-        # missing‑position breaks are never suppressed
-        if missing:
-            b["alert"] = True
-            output.append(b)
-            continue
-
-        tol = get_tolerance(cur)
-        if qty <= tol and mv <= tol:
-            # suppressed – do not add to output
-            continue
-        # material break – include with alert flag
-        b["alert"] = True
-        output.append(b)
-    return jsonify(output)
-
-# ----------------------------------------------------------------------
-# App bootstrap
+# Minimal unit‑test suite (covers default fallback & alert generation)
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # Ensure DB and tables exist
-    if not os.path.exists("fx_tolerance.db"):
-        db.create_all()
-        # seed a default tolerance of 0.0 to avoid null look‑ups
-        db.session.add(Tolerance(currency="DEFAULT", value=0.0))
-        db.session.commit()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    import unittest
+
+    class FxToleranceTests(unittest.TestCase):
+        def setUp(self):
+            self.audit = AuditLog()
+            self.store = ToleranceStore(self.audit)
+            self.engine = ReconciliationEngine(self.store)
+            # ensure a known default for each test
+            set_default_tolerance(0.05)
+
+        def test_default_fallback(self):
+            # No per‑currency entry for GBP; should use default 0.05
+            self.assertAlmostEqual(self.store.get_tolerance("GBP"), 0.05)
+
+        def test_configured_tolerance_overrides_default(self):
+            self.store.set_tolerance("alice", "Ops", "EUR", 0.02)
+            self.assertAlmostEqual(self.store.get_tolerance("EUR"), 0.02)
+
+        def test_alert_when_exceeds_configured_tolerance(self):
+            self.store.set_tolerance("bob", "Manager", "JPY", 0.01)
+            alert = self.engine.process_break("JPY", qty_diff=0.02, mv_diff=0.005)
+            self.assertIsNotNone(alert)
+            self.assertEqual(alert.currency, "JPY")
+            self.assertEqual(alert.reason, "exceeds_tolerance")
+
+        def test_no_alert_when_within_tolerance(self):
+            self.store.set_tolerance("carol", "Ops", "USD", 0.03)
+            alert = self.engine.process_break("USD", qty_diff=0.01, mv_diff=0.02)
+            self.assertIsNone(alert)
+
+        def test_alert_for_missing_position_regardless_of_tolerance(self):
+            alert = self.engine.process_break("CHF", qty_diff=0.0, mv_diff=0.0, missing_position=True)
+            self.assertIsNotNone(alert)
+            self.assertEqual(alert.reason, "missing_position")
+
+        def test_audit_log_records_create_update_delete(self):
+            self.store.set_tolerance("dave", "Ops", "CAD", 0.04)  # create
+            self.store.set_tolerance("dave", "Ops", "CAD", 0.06)  # update
+            self.store.delete_tolerance("dave", "Ops", "CAD")    # delete
+            entries = self.audit.query(user_id="dave")
+            ops = [e.operation for e in entries]
+            self.assertEqual(ops, ["create", "update", "delete"])
+
+        def test_audit_log_is_immutable(self):
+            self.store.set_tolerance("eve", "Manager", "AUD", 0.02)
+            with self.assertRaises(AttributeError):
+                # Attempt to modify an entry should raise because dataclass is frozen
+                self.audit._entries[0].operation = "tamper"
+
+    unittest.main(verbosity=2, exit=False)
 ```
 
 ## Self-review
-- **Scope adherence:** Implements per‑currency CRUD, default tolerance, immutable audit logging, and break‑suppression logic exactly as described; no UI or external integrations added.  
-- **Security & validation:** Role check is simple but meets the requirement; tolerance values are validated to be non‑negative numeric via both model constraint and request validation.  
-- **Immutability:** AuditLog has no update/delete endpoints, ensuring append‑only behavior; foreign‑key constraints are unnecessary given the simple design.  
-- **Extensibility:** The tolerance lookup falls back to the `DEFAULT` record, making future extensions (e.g., per‑region overrides) straightforward.
+- **Scope adherence:** Implements only the core logic (tolerance store, default fallback, alert generation, immutable audit log) without any UI or external integrations, matching the primary story.
+- **Correctness:** Validation, role checks, and default handling follow the acceptance criteria; unit tests verify fallback, alert conditions, and audit immutability.
+- **Maintainability:** Clear separation of concerns (store, audit, engine) and use of frozen dataclasses ensure future extensions (e.g., persistence) can be added with minimal impact.
