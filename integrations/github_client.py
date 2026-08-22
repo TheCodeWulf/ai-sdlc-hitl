@@ -75,15 +75,19 @@ class GitHubClient:
         return PRResult(number=pr.number, url=pr.html_url, branch=branch, dry_run=False)
 
     # ---- PR Review phase: post the AI review + SAST findings on the PR ------
-    def post_findings(self, pr_number: int | None, summary: str,
-                      request_changes: bool = False) -> None:
-        """Post the review agent's findings as a PR review (COMMENT or REQUEST_CHANGES)."""
-        event = "REQUEST_CHANGES" if request_changes else "COMMENT"
+    def post_findings(self, pr_number, summary, request_changes=False):
+        """Post findings on the PR. GitHub forbids REQUEST_CHANGES/APPROVE on your
+        OWN PR, so use a COMMENT review and fall back to a plain PR comment."""
+        verdict = "REQUEST CHANGES" if request_changes else "COMMENT"
+        body = f"**AI Code Review - {verdict}**\n\n{summary}"
         if self.dry_run:
-            print(f"[dry-run] post review on PR #{pr_number} as {event}:\n{summary[:300]}...")
+            print(f"[dry-run] post review on PR #{pr_number} ({verdict}):\n{summary[:300]}...")
             return
         pr = self._repo.get_pull(pr_number)
-        pr.create_review(body=summary, event=event)
+        try:
+            pr.create_review(body=body, event="COMMENT")   # allowed on own PR
+        except Exception:
+            pr.create_issue_comment(body)                  # ultimate fallback
 
     # ---- HITL approval: merge & check in -----------------------------------
     def merge_pr(self, pr_number: int | None, method: str = "squash") -> str:
