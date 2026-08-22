@@ -71,23 +71,54 @@ def after_pr(artifacts, state):
         print(f"  -> GitHub review skipped: {e}")
         return request_changes
 
+import re
+def _norm(s):
+    return s.strip().lstrip("#*").strip().rstrip("*").strip().lower()
+
 def _first_line(md, header):
+    """Find an epic/heading title. Handles '## Epic', '**Epic**', 'Epic:' etc."""
+    key = header.replace("#", "").strip().lower()
     lines = md.splitlines()
     for i, l in enumerate(lines):
-        if l.strip().lower().startswith(header.lower()):
+        if _norm(l).startswith(key):
+            after = re.split(key, l, flags=re.I)[-1].strip(" *:#")
+            if after:
+                return after
             for nxt in lines[i+1:]:
                 if nxt.strip():
-                    return nxt.strip().lstrip("-* ").strip()
+                    return nxt.strip().lstrip("-*# ").strip()
     return None
 
 def _bullets(md, header):
+    """Extract clean story titles under a heading. Handles '1. **Title** - desc',
+    trailing bold markers, and title/description on the same line."""
+    key = header.replace("#", "").strip().lower()
     out, grab = [], False
     for l in md.splitlines():
-        s = l.strip()
-        if s.lower().startswith(header.lower()): grab = True; continue
-        if grab and s.startswith("##"): break
-        if grab and (s.startswith("-") or s.startswith("*") or s[:2].strip().isdigit()):
-            out.append(s.lstrip("-*0123456789. ").strip())
+        n = _norm(l)
+        if n.startswith(key):
+            grab = True
+            continue
+        if grab and (n.startswith("acceptance") or n.startswith("out of scope") or (l.strip().startswith("#") and not l.strip().lstrip("#").strip()[:1].isdigit())):
+            break
+        if grab:
+            title = None
+            m = re.match(r"\s*\d+\.\s*(.+)$", l)                 # "1. anything"
+            if m:
+                title = m.group(1)
+            elif l.strip().startswith(("-", "*")) and not l.strip().startswith("**"):
+                title = l.strip().lstrip("-* ").strip()
+            if title:
+                # take the bolded title if present: **Title**
+                b = re.search(r"\*\*(.+?)\*\*", title)
+                if b:
+                    title = b.group(1)
+                # otherwise cut at the first dash / em-dash (title - description)
+                else:
+                    title = re.split(r"\s[-–—]\s", title)[0]
+                title = title.strip().strip("*").strip()
+                if title:
+                    out.append(title)
     return out or ["Primary story"]
 
 def build_ctx(key, artifacts, transcript):
