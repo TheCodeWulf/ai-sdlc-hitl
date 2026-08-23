@@ -29,7 +29,10 @@ PO = Agent("po", "PO / Backlog", "Requirements & Backlog",
     "PO reviews epics & stories before they enter the backlog",
     "You are a Product Owner agent. Turn a brief into a crisp, testable backlog. Concise; no preamble.",
     "From the brief below produce: ## Epic (one line), ## User Stories (2-4, 'As a.. I want.. so that..'), "
-    "## Acceptance Criteria (3-5 testable), ## Out of Scope.")
+    "## Acceptance Criteria (3-5 testable), ## Out of Scope.\n"
+    "Then, at the very end, output a ## Backlog JSON section containing a single fenced ```json code block "
+    'with this exact shape: {"epic": "<one-line epic title>", "stories": ["<short 3-6 word story title>", ...]}. '
+    "Story titles here must be SHORT labels (e.g. 'Configure Tolerances'), NOT the full 'As a...' sentence.")
 
 CODE = Agent("code", "Code Assistant", "Software Engineering",
     "Developer reviews the code locally before commit",

@@ -35,15 +35,38 @@ def gate(a, auto):
         print("  choose a/r/q")
 
 # ---- integration hooks (fire AFTER the phase gate) -----------------------
+def _parse_po_json(md):
+    """Deterministic path: read the ## Backlog JSON block the PO agent emits."""
+    import json
+    m = re.search(r"```json\s*(\{.*?\})\s*```", md, re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(1))
+        epic = (d.get("epic") or "").strip()
+        stories = [s.strip() for s in d.get("stories", []) if s and s.strip()]
+        if epic and stories:
+            return epic, stories
+    except Exception:
+        pass
+    return None
+
 def after_po(artifacts):
     from jira_client import JiraClient, BacklogItem
-    epic = _first_line(artifacts["po"], "## Epic") or "Backlog epic"
-    stories = _bullets(artifacts["po"], "## User Stories")[:4]
+    parsed = _parse_po_json(artifacts["po"])
+    if parsed:
+        epic, stories = parsed
+    else:  # fallback to heuristic parse of the prose
+        epic = _first_line(artifacts["po"], "## Epic") or "Backlog epic"
+        stories = _bullets(artifacts["po"], "## User Stories")[:4]
     try:
         res = JiraClient().create_epic_and_stories(BacklogItem(epic=epic, stories=stories))
-        print(f"  -> Jira: Epic {res.epic_key}, Stories {res.story_keys}" + (" (dry-run)" if res.dry_run else ""))
+        loc = f" -> {res.url}" if res.url else ""
+        print(f"  -> Jira: Epic {res.epic_key}, Stories {res.story_keys}" + (" (dry-run)" if res.dry_run else loc))
     except SystemExit as e:
         print(f"  -> Jira skipped: {e}")
+    except Exception as e:
+        print(f"  -> Jira error (continuing): {e}")
 
 def after_code(artifacts, state):
     from github_client import GitHubClient
