@@ -81,15 +81,19 @@ def hook_po():
     except Exception as e: return f"Jira skipped: {e}"
 
 def hook_code():
-    from github_client import GitHubClient
+    from github_client import GitHubClient, extract_code_file
     try:
         gh = GitHubClient()
+        epic = (parse_po_json(ss.artifacts.get('po','')) or ['feature'])[0]
+        code_path, code_text = extract_code_file(ss.artifacts["code"], fallback_name=epic)
+        doc_path = f"docs/{code_path.split('/')[-1].replace('.py','')}_change.md"
         pr = gh.open_pr(branch=f"feature/ui-{time.strftime('%Y%m%d-%H%M%S')}",
-                        title=(parse_po_json(ss.artifacts.get('po','')) or ['Implement backlog item'])[0],
-                        body="Implements the approved backlog (via Streamlit UI).",
-                        files={"app/generated_change.md": ss.artifacts["code"]})
+                        title=epic if epic != 'feature' else 'Implement backlog item',
+                        body=f"Implements the approved backlog (via Streamlit UI).\n\nAdds `{code_path}` with design note & self-review in `docs/`.",
+                        files={code_path: code_text, doc_path: ss.artifacts["code"]})
         ss.links["pr"] = pr.url; ss.setdefault("pr_number", pr.number)
-        return f"PR opened: {pr.url}" + (" (dry-run)" if pr.dry_run else "")
+        ss["code_path"] = code_path
+        return f"PR opened: {pr.url}  ·  committed {code_path}" + (" (dry-run)" if pr.dry_run else "")
     except Exception as e: return f"PR skipped: {e}"
 
 def hook_pr():
