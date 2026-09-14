@@ -75,19 +75,27 @@ class GitHubClient:
         return PRResult(number=pr.number, url=pr.html_url, branch=branch, dry_run=False)
 
     # ---- PR Review phase: post the AI review + SAST findings on the PR ------
-    def post_findings(self, pr_number, summary, request_changes=False):
-        """Post findings on the PR. GitHub forbids REQUEST_CHANGES/APPROVE on your
-        OWN PR, so use a COMMENT review and fall back to a plain PR comment."""
+    def post_findings(self, pr_number: int | None, summary: str,
+                      request_changes: bool = False) -> None:
+        """Post the review agent's findings on the PR.
+
+        Note: GitHub forbids REQUEST_CHANGES / APPROVE reviews on your OWN PR, so we
+        try a COMMENT review first and fall back to a normal PR comment (always allowed).
+        The verdict is prefixed into the text either way.
+        """
+        event = "REQUEST_CHANGES" if request_changes else "COMMENT"
         verdict = "REQUEST CHANGES" if request_changes else "COMMENT"
         body = f"**AI Code Review - {verdict}**\n\n{summary}"
         if self.dry_run:
-            print(f"[dry-run] post review on PR #{pr_number} ({verdict}):\n{summary[:300]}...")
+            print(f"[dry-run] post review on PR #{pr_number} as {event}:\n{summary[:300]}...")
             return
         pr = self._repo.get_pull(pr_number)
         try:
-            pr.create_review(body=body, event="COMMENT")   # allowed on own PR
+            # COMMENT event is allowed on your own PR; REQUEST_CHANGES/APPROVE are not.
+            pr.create_review(body=body, event="COMMENT")
         except Exception:
-            pr.create_issue_comment(body)                  # ultimate fallback
+            # ultimate fallback: a plain issue comment on the PR thread
+            pr.create_issue_comment(body)
 
     # ---- HITL approval: merge & check in -----------------------------------
     def merge_pr(self, pr_number: int | None, method: str = "squash") -> str:
@@ -98,6 +106,36 @@ class GitHubClient:
         pr = self._repo.get_pull(pr_number)
         res = pr.merge(merge_method=method, commit_message="Merged after human approval (HITL).")
         return res.sha
+
+
+# --------------------------------------------------------------------------
+# Helper: turn the Code agent's markdown into a real source file under src/.
+# Extracts the first fenced code block; names it from the line-1 filename
+# comment if present, else from a fallback slug. Always sanitised into src/.
+# --------------------------------------------------------------------------
+import re as _re
+
+def extract_code_file(code_markdown: str, fallback_name: str = "feature") -> tuple[str, str]:
+    """Return (repo_path, code_text). repo_path is always 'src/<safe>.py'."""
+    m = _re.search(r"```(?:python|py)?\s*\n(.*?)```", code_markdown, _re.S)
+    code = (m.group(1) if m else code_markdown).strip("\n") + "\n"
+
+    # 1) filename from a line-1 comment like  "# reconciler_tolerance.py"
+    name = None
+    first = code.splitlines()[0] if code.splitlines() else ""
+    fm = _re.match(r"\s*#\s*([A-Za-z0-9_\-/]+\.py)\s*$", first)
+    if fm:
+        name = fm.group(1).split("/")[-1]           # strip any path
+    # 2) else derive from the fallback (epic/story title)
+    if not name:
+        slug = _re.sub(r"[^a-z0-9]+", "_", fallback_name.lower()).strip("_") or "feature"
+        name = f"{slug}.py"
+
+    # sanitise: lowercase, underscores, must end in .py, no path tricks
+    name = _re.sub(r"[^a-z0-9_.\-]", "", name.lower())
+    if not name.endswith(".py"):
+        name += ".py"
+    return f"src/{name}", code
 
 
 # --------------------------------------------------------------------------
