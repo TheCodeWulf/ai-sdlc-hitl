@@ -107,6 +107,21 @@ class GitHubClient:
         res = pr.merge(merge_method=method, commit_message="Merged after human approval (HITL).")
         return res.sha
 
+    # ---- add more files to an EXISTING branch (e.g. tests -> same PR) -------
+    def commit_files_to_branch(self, branch: str, files: dict[str, str]) -> None:
+        """Commit files onto an existing branch so they appear in the same open PR."""
+        if self.dry_run:
+            for p in files:
+                print(f"[dry-run]   commit {p} ({len(files[p])} bytes) -> {branch}")
+            return
+        repo = self._repo
+        for path, content in files.items():
+            try:
+                existing = repo.get_contents(path, ref=branch)
+                repo.update_file(path, f"agent: update {path}", content, existing.sha, branch=branch)
+            except Exception:
+                repo.create_file(path, f"agent: add {path}", content, branch=branch)
+
 
 # --------------------------------------------------------------------------
 # Helper: turn the Code agent's markdown into a real source file under src/.
@@ -136,6 +151,25 @@ def extract_code_file(code_markdown: str, fallback_name: str = "feature") -> tup
     if not name.endswith(".py"):
         name += ".py"
     return f"src/{name}", code
+
+
+def extract_test_files(test_markdown: str, feature_slug: str = "feature") -> dict[str, str]:
+    """From the Test agent's markdown, pull the Gherkin .feature and the step-def .py.
+    Returns a dict of repo_path -> content (only the blocks that were found)."""
+    slug = _re.sub(r"[^a-z0-9]+", "_", feature_slug.lower()).strip("_") or "feature"
+    out = {}
+    # Gherkin feature block: ```gherkin ... ```  (fallback: ```feature ...)
+    g = _re.search(r"```(?:gherkin|feature|cucumber)\s*\n(.*?)```", test_markdown, _re.S)
+    if g:
+        out[f"tests/{slug}.feature"] = g.group(1).strip("\n") + "\n"
+    # Python step definitions: first ```python block
+    p = _re.search(r"```(?:python|py)\s*\n(.*?)```", test_markdown, _re.S)
+    if p:
+        out[f"tests/test_{slug}.py"] = p.group(1).strip("\n") + "\n"
+    # if nothing parsed, still drop the raw markdown so the phase isn't lost
+    if not out:
+        out[f"tests/{slug}_tests.md"] = test_markdown
+    return out
 
 
 # --------------------------------------------------------------------------

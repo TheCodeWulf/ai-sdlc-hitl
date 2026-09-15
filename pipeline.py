@@ -86,12 +86,35 @@ def after_code(artifacts, state):
                         body=f"Implements the approved backlog.\n\nAdds `{code_path}` with the design note and self-review in `docs/`.",
                         files=files)
         state["pr_number"] = pr.number
+        state["branch"] = branch
         print(f"  -> GitHub PR opened: {pr.url}" + (" (dry-run)" if pr.dry_run else ""))
         print(f"     committed: {code_path}")
     except SystemExit as e:
         print(f"  -> GitHub PR skipped: {e}")
     except Exception as e:
         print(f"  -> GitHub PR error (continuing): {e}")
+
+def after_test(artifacts, state):
+    from github_client import GitHubClient, extract_test_files
+    import time
+    epic = _first_line(artifacts.get("po",""), "## Epic") or "feature"
+    test_files = extract_test_files(artifacts["test"], feature_slug=epic)
+    qe_branch = f"qe/tests-{time.strftime('%Y%m%d-%H%M%S')}"
+    code_pr = state.get("pr_number")
+    ref = f"\n\nIndependent QE verification for PR #{code_pr} — behavior tests against the acceptance criteria (separation of duties)." if code_pr else "\n\nIndependent QE verification — behavior tests against the acceptance criteria."
+    title = (f"QE: acceptance tests for {epic}" if epic != "feature" else "QE: acceptance tests")
+    try:
+        gh = GitHubClient()
+        pr = gh.open_pr(branch=qe_branch, title=title[:120],
+                        body="Behavior/BDD tests authored by the QE agent." + ref,
+                        files=test_files)
+        state["qe_pr_number"] = pr.number
+        print(f"  -> GitHub QE PR opened: {pr.url}" + (" (dry-run)" if pr.dry_run else ""))
+        print(f"     committed: {', '.join(test_files.keys())}")
+    except SystemExit as e:
+        print(f"  -> QE PR skipped: {e}")
+    except Exception as e:
+        print(f"  -> QE PR error (continuing): {e}")
 
 def after_pr(artifacts, state):
     from github_client import GitHubClient
@@ -192,6 +215,7 @@ def main():
         # integration hooks AFTER the gate
         if key == "po":   after_po(artifacts)
         if key == "code": after_code(artifacts, state)
+        if key == "test": after_test(artifacts, state)
         if key == "pr":
             changes = after_pr(artifacts, state)
             if not changes and not args.auto:
