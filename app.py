@@ -93,8 +93,26 @@ def hook_code():
                         files={code_path: code_text, doc_path: ss.artifacts["code"]})
         ss.links["pr"] = pr.url; ss.setdefault("pr_number", pr.number)
         ss["code_path"] = code_path
+        ss["branch"] = pr.branch
         return f"PR opened: {pr.url}  ·  committed {code_path}" + (" (dry-run)" if pr.dry_run else "")
     except Exception as e: return f"PR skipped: {e}"
+
+def hook_test():
+    from github_client import GitHubClient, extract_test_files
+    import time
+    epic = (parse_po_json(ss.artifacts.get('po','')) or ['feature'])[0]
+    files = extract_test_files(ss.artifacts["test"], feature_slug=epic)
+    code_pr = ss.get("pr_number")
+    ref = f" Independent QE verification for PR #{code_pr} (separation of duties)." if code_pr else " Independent QE verification."
+    try:
+        gh = GitHubClient()
+        pr = gh.open_pr(branch=f"qe/tests-{time.strftime('%Y%m%d-%H%M%S')}",
+                        title=(f"QE: acceptance tests for {epic}" if epic != 'feature' else 'QE: acceptance tests')[:120],
+                        body="Behavior/BDD tests authored by the QE agent." + ref,
+                        files=files)
+        ss.links["qe_pr"] = pr.url
+        return "QE PR opened: " + pr.url + "  ·  " + ", ".join(files.keys()) + (" (dry-run)" if pr.dry_run else "")
+    except Exception as e: return f"QE PR skipped: {e}"
 
 def hook_pr():
     from github_client import GitHubClient
@@ -104,7 +122,7 @@ def hook_pr():
         return f"Review posted ({'REQUEST_CHANGES' if rc else 'COMMENT'})"
     except Exception as e: return f"Review skipped: {e}"
 
-HOOKS = {"po": hook_po, "code": hook_code, "pr": hook_pr}
+HOOKS = {"po": hook_po, "code": hook_code, "test": hook_test, "pr": hook_pr}
 
 # ---- sidebar ----
 with st.sidebar:
@@ -129,7 +147,9 @@ with st.sidebar:
         if "jira" in ss.links:
             st.markdown(f"<div class='link-card'>🎫 <a href='{ss.links['jira']}' target='_blank'>Jira epic</a></div>", unsafe_allow_html=True)
         if "pr" in ss.links:
-            st.markdown(f"<div class='link-card'>🔀 <a href='{ss.links['pr']}' target='_blank'>GitHub PR</a></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='link-card'>🔀 <a href='{ss.links['pr']}' target='_blank'>Code PR</a></div>", unsafe_allow_html=True)
+        if "qe_pr" in ss.links:
+            st.markdown(f"<div class='link-card'>🧪 <a href='{ss.links['qe_pr']}' target='_blank'>QE tests PR</a></div>", unsafe_allow_html=True)
     st.divider()
     if st.button("↺ Reset run", use_container_width=True):
         for k in ("step","artifacts","draft","links","pr_number"): ss.pop(k, None)
@@ -186,4 +206,5 @@ for i, key in enumerate(agents.ORDER):
 if len(ss.artifacts) == len(agents.ORDER):
     st.success("🎉 Full SDLC cycle complete — every phase automated, every gate human-approved.")
     if ss.links.get("jira"): st.markdown(f"🎫 **Jira epic:** {ss.links['jira']}")
-    if ss.links.get("pr"): st.markdown(f"🔀 **GitHub PR:** {ss.links['pr']}")
+    if ss.links.get("pr"): st.markdown(f"🔀 **Code PR:** {ss.links['pr']}")
+    if ss.links.get("qe_pr"): st.markdown(f"🧪 **QE tests PR:** {ss.links['qe_pr']}")
