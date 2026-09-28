@@ -1,125 +1,140 @@
 # fx_tolerance.py
 """
-A minimal FX tolerance and alerting system.
+Minimal implementation of per‑currency FX break tolerance management with
+audit‑able change logging and evaluation helpers.
 """
 
-from dataclasses import dataclass, field
+import json
+import csv
+import os
+import threading
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Optional, Dict, Tuple
+
+# ---------------------------------------------------------------------------
+# Configuration persistence
+# ---------------------------------------------------------------------------
+_CONFIG_PATH = "tolerance_config.json"
+_AUDIT_PATH = "tolerance_audit.log"
+_LOCK = threading.Lock()
 
 
-# --------------------------------------------------------------------------- #
-# Data structures
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class Break:
-    """Represents a reconciliation break."""
-    id: int
-    currency: str
-    quantity_diff: float
-    market_value_diff: float
-    missing_position: bool = False
+def _load_config() -> Dict:
+    """Load the tolerance configuration from disk; create defaults if missing."""
+    if not os.path.exists(_CONFIG_PATH):
+        # initialise with empty per‑currency map and a default tolerance of 0.0
+        cfg = {"default": 0.0, "currencies": {}}
+        _save_config(cfg)
+        return cfg
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-@dataclass
-class AuditEntry:
-    """Immutable audit log entry for tolerance changes."""
-    timestamp: datetime
-    user: str
-    currency: Optional[str]  # None for default tolerance
-    old_value: float
-    new_value: float
+def _save_config(cfg: Dict) -> None:
+    """Write the whole config atomically."""
+    tmp = _CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+    os.replace(tmp, _CONFIG_PATH)
 
 
-# --------------------------------------------------------------------------- #
-# Core logic
-# --------------------------------------------------------------------------- #
+def _append_audit(entry: Tuple[str, str, str, Optional[float], float]) -> None:
+    """Append a single audit record; never modify existing rows."""
+    # entry = (user_id, timestamp, currency, old_value, new_value)
+    with open(_AUDIT_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(entry)
 
-class ToleranceConfig:
-    """Manages per‑currency tolerances and audit trail."""
-    def __init__(self, default_tolerance: float = 0.01):
-        self._tolerances: Dict[str, float] = {}
-        self._default = default_tolerance
-        self.audit_log: List[AuditEntry] = []
 
-    def set_tolerance(self, user: str, currency: Optional[str], value: float):
-        """Set tolerance for a specific currency or the default."""
-        old = self._tolerances.get(currency, self._default if currency is None else None)
-        if currency is None:
-            self._default = value
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def set_default_tolerance(user_id: str, value: float) -> None:
+    """
+    Set the system‑wide default tolerance.
+    Raises ValueError if value is negative.
+    """
+    if value < 0:
+        raise ValueError("Tolerance cannot be negative")
+    with _LOCK:
+        cfg = _load_config()
+        old = cfg["default"]
+        cfg["default"] = value
+        _save_config(cfg)
+        _append_audit((user_id, datetime.utcnow().isoformat(), "DEFAULT", old, value))
+
+
+def set_currency_tolerance(user_id: str, currency: str, value: float) -> None:
+    """
+    Create or update a tolerance for a specific ISO currency code.
+    Raises ValueError for invalid inputs.
+    """
+    if not currency or len(currency) != 3:
+        raise ValueError("Currency must be a 3‑letter ISO code")
+    if value < 0:
+        raise ValueError("Tolerance cannot be negative")
+    currency = currency.upper()
+    with _LOCK:
+        cfg = _load_config()
+        old = cfg["currencies"].get(currency)
+        cfg["currencies"][currency] = value
+        _save_config(cfg)
+        _append_audit((user_id, datetime.utcnow().isoformat(), currency, old, value))
+
+
+def get_tolerance(currency: str) -> float:
+    """
+    Return the tolerance for the given currency, falling back to the default.
+    """
+    cfg = _load_config()
+    return cfg["currencies"].get(currency.upper(), cfg["default"])
+
+
+def evaluate_break(currency: str, break_amount: float) -> Tuple[bool, float]:
+    """
+    Determine whether a break is within tolerance.
+
+    Returns:
+        (in_tolerance, tolerance_used)
+    """
+    tol = get_tolerance(currency)
+    in_tol = abs(break_amount) <= tol
+    return in_tol, tol
+
+
+def list_audit_log() -> list:
+    """
+    Read the audit log and return a list of dicts.
+    (Read‑only; the file is never mutated by this module.)
+    """
+    if not os.path.exists(_AUDIT_PATH):
+        return []
+    with open(_AUDIT_PATH, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, fieldnames=["user_id", "timestamp", "currency", "old", "new"])
+        return [row for row in reader]
+
+
+# ---------------------------------------------------------------------------
+# Example helper for dashboard integration (not part of core logic)
+# ---------------------------------------------------------------------------
+def filter_breaks(breaks: list) -> Tuple[list, list]:
+    """
+    Given a list of dicts with keys: 'currency' and 'amount',
+    return (in_tolerance_breaks, out_of_tolerance_alerts).
+
+    Alerts are read‑only dicts containing currency, amount, and tolerance.
+    """
+    in_tol, out_of = [], []
+    for br in breaks:
+        ok, tol = evaluate_break(br["currency"], br["amount"])
+        if ok:
+            in_tol.append(br)
         else:
-            self._tolerances[currency] = value
-        self.audit_log.append(
-            AuditEntry(
-                timestamp=datetime.utcnow(),
-                user=user,
-                currency=currency,
-                old_value=old,
-                new_value=value,
-            )
-        )
-
-    def get_tolerance(self, currency: str) -> float:
-        """Return tolerance for the given currency."""
-        return self._tolerances.get(currency, self._default)
-
-
-class ReconciliationEngine:
-    """Evaluates breaks against tolerances and generates alerts."""
-    def __init__(self, config: ToleranceConfig):
-        self.config = config
-        self.alerts: List[Break] = []
-
-    def process_breaks(self, breaks: List[Break]) -> List[Break]:
-        """Return list of breaks that should be hidden (i.e., below tolerance)."""
-        visible: List[Break] = []
-        for br in breaks:
-            if br.missing_position:
-                # Always flag missing positions
-                visible.append(br)
-                continue
-
-            tol = self.config.get_tolerance(br.currency)
-            if abs(br.quantity_diff) <= tol and abs(br.market_value_diff) <= tol:
-                # Hidden: do not add to visible list
-                continue
-            else:
-                # Exceeds tolerance: alert
-                self.alerts.append(br)
-                visible.append(br)
-        return visible
-
-    def get_alerts(self) -> List[Break]:
-        """Return all alerts generated in the last run."""
-        return self.alerts
-
-
-# --------------------------------------------------------------------------- #
-# Example usage (would normally be in tests or application code)
-# --------------------------------------------------------------------------- #
-
-if __name__ == "__main__":
-    # Setup
-    cfg = ToleranceConfig(default_tolerance=0.02)
-    cfg.set_tolerance(user="alice", currency="USD", value=0.01)
-    cfg.set_tolerance(user="bob", currency=None, value=0.03)  # change default
-
-    engine = ReconciliationEngine(cfg)
-
-    # Sample breaks
-    breaks = [
-        Break(id=1, currency="USD", quantity_diff=0.005, market_value_diff=0.004),
-        Break(id=2, currency="EUR", quantity_diff=0.02, market_value_diff=0.025),
-        Break(id=3, currency="JPY", quantity_diff=0.04, market_value_diff=0.05),
-        Break(id=4, currency="GBP", quantity_diff=0.01, market_value_diff=0.015),
-        Break(id=5, currency="USD", quantity_diff=0.0, market_value_diff=0.0, missing_position=True),
-    ]
-
-    visible = engine.process_breaks(breaks)
-    print("Visible breaks:", [b.id for b in visible])
-    print("Alerts:", [b.id for b in engine.get_alerts()])
-
-    # Audit log
-    for entry in cfg.audit_log:
-        print(entry)
+            alert = {
+                "currency": br["currency"],
+                "break_amount": br["amount"],
+                "tolerance": tol,
+                "read_only": True,
+            }
+            out_of.append(alert)
+    return in_tol, out_of
