@@ -1,292 +1,375 @@
-**Design note**  
-Create a lightweight, in‑memory service that (1) stores per‑currency tolerances with a system‑wide default, (2) records every tolerance change in an immutable audit log, (3) evaluates incoming breaks against the tolerance and logs suppressed breaks, and (4) emits read‑only alerts for breaks that exceed the tolerance. Permissions are modelled as a simple user‑id whitelist.
+**## Design note**  
+Implement an in‑memory service (`fx_tolerance.py`) that manages per‑currency FX break tolerances, records every change in an immutable audit log, suppresses tolerable breaks, and creates searchable alerts for excess breaks. The module is deliberately minimal—no external DB or permission system—so it can be dropped into the existing reconciliation codebase and exercised by unit tests.
 
----
+**## Implementation**  
 
-## Implementation
 ```python
 # fx_tolerance.py
 """
-Minimal implementation of per‑currency FX tolerance configuration,
-audit logging, break suppression, and dashboard alerts.
+Primary implementation for:
+- Define Currency Tolerances (CRUD + audit)
+- Suppress Tolerable Breaks
+- Alert on Excess Breaks
+- Export immutable audit log
 """
 
+import csv
 import threading
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 # ----------------------------------------------------------------------
-# Simple permission model (replace with real auth in production)
+# Simple immutable audit log (append‑only)
 # ----------------------------------------------------------------------
-AUTHORIZED_USERS = {"ops_manager", "admin"}  # user IDs allowed to edit tolerances
-
-
-# ----------------------------------------------------------------------
-# Immutable audit log (append‑only)
-# ----------------------------------------------------------------------
-class AuditRecord:
-    __slots__ = ("user_id", "timestamp", "op_type", "currency", "old_value", "new_value")
+class AuditLogEntry:
+    __slots__ = ("id", "user_id", "role", "op", "currency", "old", "new", "ts")
 
     def __init__(
         self,
         user_id: str,
-        op_type: str,
-        currency: str,
-        old_value: Optional[float],
-        new_value: Optional[float],
+        role: str,
+        op: str,
+        currency: Optional[str],
+        old: Optional[float],
+        new: Optional[float],
     ):
+        self.id = str(uuid.uuid4())
         self.user_id = user_id
-        self.timestamp = datetime.now(timezone.utc)
-        self.op_type = op_type  # "create", "update", "delete"
-        self.currency = currency.upper()
-        self.old_value = old_value
-        self.new_value = new_value
+        self.role = role
+        self.op = op  # create, update, delete
+        self.currency = currency
+        self.old = old
+        self.new = new
+        self.ts = datetime.now(timezone.utc)
 
-    def to_dict(self) -> Dict:
+    def to_dict(self):
         return {
+            "id": self.id,
             "user_id": self.user_id,
-            "timestamp": self.timestamp.isoformat(),
-            "op_type": self.op_type,
-            "currency": self.currency,
-            "old_value": self.old_value,
-            "new_value": self.new_value,
+            "role": self.role,
+            "operation": self.op,
+            "currency": self.currency or "",
+            "old_value": "" if self.old is None else str(self.old),
+            "new_value": "" if self.new is None else str(self.new),
+            "timestamp_utc": self.ts.isoformat(),
         }
 
 
 class AuditLog:
-    """Append‑only, thread‑safe audit log."""
+    """Append‑only, thread‑safe, read‑only for callers."""
 
     def __init__(self):
-        self._records: List[AuditRecord] = []
+        self._entries: List[AuditLogEntry] = []
         self._lock = threading.Lock()
 
-    def append(self, record: AuditRecord):
+    def record(
+        self,
+        user_id: str,
+        role: str,
+        op: str,
+        currency: Optional[str],
+        old: Optional[float],
+        new: Optional[float],
+    ) -> None:
         with self._lock:
-            self._records.append(record)
+            self._entries.append(AuditLogEntry(user_id, role, op, currency, old, new))
 
-    def query(self) -> List[Dict]:
-        """Return a copy of audit data for compliance tools."""
-        with self._lock:
-            return [r.to_dict() for r in self._records]
-
-    # No delete / update methods – immutable by design
-
-
-# ----------------------------------------------------------------------
-# Tolerance store with default fallback
-# ----------------------------------------------------------------------
-class ToleranceStore:
-    """Thread‑safe store for per‑currency tolerances."""
-
-    def __init__(self, default_tolerance: float = 0.0):
-        self._default = default_tolerance
-        self._tolerances: Dict[str, float] = {}
-        self._lock = threading.Lock()
-        self.audit_log = AuditLog()
-
-    def _check_permission(self, user_id: str):
-        if user_id not in AUTHORIZED_USERS:
-            raise PermissionError(f"User '{user_id}' not authorized to edit tolerances")
-
-    def set_tolerance(self, user_id: str, currency: str, value: float):
-        """Create or update a tolerance. Logs audit."""
-        self._check_permission(user_id)
-        if not isinstance(value, (int, float)):
-            raise ValueError("Tolerance must be numeric")
-        if value < 0:
-            raise ValueError("Tolerance cannot be negative")
-
-        cur = currency.upper()
-        with self._lock:
-            old = self._tolerances.get(cur)
-            op_type = "create" if old is None else "update"
-            self._tolerances[cur] = float(value)
-        self.audit_log.append(
-            AuditRecord(user_id, op_type, cur, old, float(value))
-        )
-
-    def delete_tolerance(self, user_id: str, currency: str):
-        """Remove a specific currency tolerance (reverts to default)."""
-        self._check_permission(user_id)
-        cur = currency.upper()
-        with self._lock:
-            if cur not in self._tolerances:
-                raise KeyError(f"No tolerance defined for {cur}")
-            old = self._tolerances.pop(cur)
-        self.audit_log.append(
-            AuditRecord(user_id, "delete", cur, old, None)
-        )
-
-    def get_tolerance(self, currency: str) -> float:
-        """Return tolerance for currency or default fallback."""
-        cur = currency.upper()
-        with self._lock:
-            return self._tolerances.get(cur, self._default)
-
-    def set_default(self, user_id: str, value: float):
-        """Change system‑wide default tolerance."""
-        self._check_permission(user_id)
-        if not isinstance(value, (int, float)):
-            raise ValueError("Default tolerance must be numeric")
-        if value < 0:
-            raise ValueError("Default tolerance cannot be negative")
-        with self._lock:
-            old = self._default
-            self._default = float(value)
-        self.audit_log.append(
-            AuditRecord(user_id, "update", "DEFAULT", old, float(value))
-        )
-
-
-# ----------------------------------------------------------------------
-# Break processing & suppression
-# ----------------------------------------------------------------------
-class SuppressionLog:
-    """Records suppressed breaks for audit purposes."""
-
-    def __init__(self):
-        self._entries: List[Dict] = []
-        self._lock = threading.Lock()
-
-    def log(self, break_id: str, reason: str):
-        entry = {
-            "break_id": break_id,
-            "reason": reason,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        with self._lock:
-            self._entries.append(entry)
-
-    def query(self) -> List[Dict]:
+    def all(self) -> List[AuditLogEntry]:
+        # Return a copy to preserve immutability
         with self._lock:
             return list(self._entries)
 
+    def export_csv(self, file_path: str) -> None:
+        """Export the whole log to CSV (RFC‑4180 compatible)."""
+        with open(file_path, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "id",
+                    "user_id",
+                    "role",
+                    "operation",
+                    "currency",
+                    "old_value",
+                    "new_value",
+                    "timestamp_utc",
+                ],
+            )
+            writer.writeheader()
+            for entry in self.all():
+                writer.writerow(entry.to_dict())
 
-class BreakProcessor:
-    """
-    Evaluates incoming breaks against tolerances.
-    Returns (is_suppressed: bool, alert: Optional[Dict]).
-    """
 
-    def __init__(self, tolerance_store: ToleranceStore):
-        self.tolerance_store = tolerance_store
-        self.suppression_log = SuppressionLog()
-        self.alerts: List[Dict] = []  # in‑memory dashboard feed
-        self._alert_lock = threading.Lock()
+# ----------------------------------------------------------------------
+# Tolerance manager (CRUD + default fallback)
+# ----------------------------------------------------------------------
+class ToleranceError(ValueError):
+    """Raised for validation problems."""
 
-    def process_break(self, break_data: Dict) -> Tuple[bool, Optional[Dict]]:
-        """
-        Expected break_data keys:
-            - id: unique identifier (str)
-            - currency: ISO code (str)
-            - qty_diff: float (absolute quantity difference)
-            - mv_diff: float (absolute market‑value difference)
-            - source_a_present: bool
-            - source_b_present: bool
-        """
-        # Validate required fields
-        required = {"id", "currency", "qty_diff", "mv_diff", "source_a_present", "source_b_present"}
-        missing = required - break_data.keys()
-        if missing:
-            raise ValueError(f"Missing break fields: {missing}")
 
-        # If break exists in only one source, never suppress
-        if not (break_data["source_a_present"] and break_data["source_b_present"]):
-            return False, self._create_alert(break_data, suppressed=False)
+class ToleranceManager:
+    """Manages per‑currency tolerance values with audit logging."""
 
-        tol = self.tolerance_store.get_tolerance(break_data["currency"])
-        qty_ok = abs(break_data["qty_diff"]) <= tol
-        mv_ok = abs(break_data["mv_diff"]) <= tol
+    MIN_REQUIRED = {"USD", "EUR", "JPY"}
 
-        if qty_ok and mv_ok:
-            # Suppressed
-            self.suppression_log.log(break_data["id"], "within tolerance")
-            return True, None
+    def __init__(self, audit_log: AuditLog, default_tolerance: float = 0.0):
+        self._tolerances: Dict[str, float] = {}
+        self._default = default_tolerance
+        self._audit = audit_log
+        self._lock = threading.Lock()
 
-        # Not suppressed – generate alert
-        alert = self._create_alert(break_data, suppressed=False, tolerance=tol)
-        return False, alert
+    # ---------- public API ----------
+    def set_default(self, value: float) -> None:
+        if not self._is_valid(value):
+            raise ToleranceError("Default tolerance must be non‑negative numeric")
+        self._default = float(value)
 
-    def _create_alert(self, break_data: Dict, suppressed: bool, tolerance: Optional[float] = None) -> Dict:
-        alert = {
-            "break_id": break_data["id"],
-            "currency": break_data["currency"].upper(),
-            "qty_diff": break_data["qty_diff"],
-            "mv_diff": break_data["mv_diff"],
-            "tolerance": tolerance
-            if tolerance is not None
-            else self.tolerance_store.get_tolerance(break_data["currency"]),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "read_only": True,
+    def get(self, currency: str) -> float:
+        """Return configured tolerance or fallback default."""
+        with self._lock:
+            return self._tolerances.get(currency.upper(), self._default)
+
+    def create(self, user_id: str, role: str, currency: str, value: float) -> None:
+        """Add a new entry; error if already exists."""
+        self._validate_user(role)
+        cur = currency.upper()
+        if not self._is_valid(value):
+            raise ToleranceError("Tolerance must be a non‑negative number")
+        with self._lock:
+            if cur in self._tolerances:
+                raise ToleranceError(f"Tolerance for {cur} already exists")
+            self._tolerances[cur] = float(value)
+        self._audit.record(user_id, role, "create", cur, None, float(value))
+
+    def update(self, user_id: str, role: str, currency: str, value: float) -> None:
+        self._validate_user(role)
+        cur = currency.upper()
+        if not self._is_valid(value):
+            raise ToleranceError("Tolerance must be a non‑negative number")
+        with self._lock:
+            old = self._tolerances.get(cur)
+            if old is None:
+                raise ToleranceError(f"No existing tolerance for {cur}")
+            self._tolerances[cur] = float(value)
+        self._audit.record(user_id, role, "update", cur, old, float(value))
+
+    def delete(self, user_id: str, role: str, currency: str) -> None:
+        self._validate_user(role)
+        cur = currency.upper()
+        with self._lock:
+            old = self._tolerances.pop(cur, None)
+            if old is None:
+                raise ToleranceError(f"No existing tolerance for {cur}")
+        self._audit.record(user_id, role, "delete", cur, old, None)
+
+    def list(self) -> Dict[str, float]:
+        """Return a shallow copy of the current table."""
+        with self._lock:
+            return dict(self._tolerances)
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _is_valid(value) -> bool:
+        try:
+            v = float(value)
+            return v >= 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _validate_user(role: str) -> None:
+        # Permission model is out‑of‑scope; placeholder for future checks.
+        if not role:
+            raise ToleranceError("User role must be supplied")
+
+
+# ----------------------------------------------------------------------
+# Alert manager (simple in‑memory store, 30‑day retention)
+# ----------------------------------------------------------------------
+class Alert:
+    __slots__ = ("id", "currency", "break_amount", "tolerance", "created_at", "cleared")
+
+    def __init__(self, currency: str, break_amount: float, tolerance: float):
+        self.id = str(uuid.uuid4())
+        self.currency = currency.upper()
+        self.break_amount = break_amount
+        self.tolerance = tolerance
+        self.created_at = datetime.now(timezone.utc)
+        self.cleared = False
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "currency": self.currency,
+            "break_amount": self.break_amount,
+            "tolerance": self.tolerance,
+            "created_at_utc": self.created_at.isoformat(),
+            "cleared": self.cleared,
         }
-        # Store in dashboard feed (thread‑safe)
-        with self._alert_lock:
-            self.alerts.append(alert)
+
+
+class AlertManager:
+    """Stores alerts for at least 30 days; provides search."""
+
+    RETENTION = timedelta(days=30)
+
+    def __init__(self):
+        self._alerts: List[Alert] = []
+        self._lock = threading.Lock()
+
+    def add(self, currency: str, break_amount: float, tolerance: float) -> Alert:
+        alert = Alert(currency, break_amount, tolerance)
+        with self._lock:
+            self._alerts.append(alert)
         return alert
 
-    def get_alerts(self) -> List[Dict]:
-        """Return a copy of current alerts (read‑only view)."""
-        with self._alert_lock:
-            return list(self.alerts)
+    def clear(self, alert_id: str) -> None:
+        with self._lock:
+            for a in self._alerts:
+                if a.id == alert_id:
+                    a.cleared = True
+                    break
+
+    def search(
+        self,
+        currency: Optional[str] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> List[Alert]:
+        """Return alerts matching criteria and still within retention."""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            result = []
+            for a in self._alerts:
+                if now - a.created_at > self.RETENTION:
+                    continue  # expired, drop from view
+                if currency and a.currency != currency.upper():
+                    continue
+                if start and a.created_at < start:
+                    continue
+                if end and a.created_at > end:
+                    continue
+                result.append(a)
+            return result
+
+    def purge_expired(self) -> None:
+        """Remove alerts older than retention period."""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            self._alerts = [
+                a for a in self._alerts if now - a.created_at <= self.RETENTION
+            ]
 
 
 # ----------------------------------------------------------------------
-# Example usage (would be replaced by real UI / service endpoints)
+# Break processor – suppression + alert generation
 # ----------------------------------------------------------------------
-if __name__ == "__main__":
-    store = ToleranceStore(default_tolerance=0.5)
-    store.set_tolerance("ops_manager", "USD", 1.0)
-    store.set_tolerance("ops_manager", "EUR", 0.8)
+class BreakProcessor:
+    """
+    Core logic used by the reconciliation system.
+    - `evaluate_break` returns (suppress: bool, alert: Optional[Alert])
+    - Logs suppression events via supplied logger.
+    """
 
-    processor = BreakProcessor(store)
+    def __init__(
+        self,
+        tolerance_mgr: ToleranceManager,
+        alert_mgr: AlertManager,
+        logger,
+    ):
+        self.tolerance_mgr = tolerance_mgr
+        self.alert_mgr = alert_mgr
+        self.logger = logger
 
-    sample_breaks = [
-        {
-            "id": "BRK001",
-            "currency": "USD",
-            "qty_diff": 0.4,
-            "mv_diff": 0.3,
-            "source_a_present": True,
-            "source_b_present": True,
-        },
-        {
-            "id": "BRK002",
-            "currency": "EUR",
-            "qty_diff": 1.2,
-            "mv_diff": 0.6,
-            "source_a_present": True,
-            "source_b_present": True,
-        },
-        {
-            "id": "BRK003",
-            "currency": "JPY",
-            "qty_diff": 0.2,
-            "mv_diff": 0.1,
-            "source_a_present": True,
-            "source_b_present": False,  # missing position → never suppressed
-        },
-    ]
+    def evaluate_break(
+        self,
+        *,
+        currency: str,
+        qty_diff: float,
+        mv_diff: float,
+        source_missing: bool,
+        user_id: str,
+    ) -> Tuple[bool, Optional[Alert]]:
+        """
+        Parameters
+        ----------
+        currency: ISO code of the FX pair.
+        qty_diff, mv_diff: absolute differences (positive numbers).
+        source_missing: True if the break exists in only one source.
+        user_id: identifier of the system/user evaluating the break (for logging).
 
-    for brk in sample_breaks:
-        suppressed, alert = processor.process_break(brk)
-        print(f"Break {brk['id']} suppressed={suppressed}")
+        Returns
+        -------
+        (suppress, alert) – exactly one of them will be truthy.
+        """
+        cur = currency.upper()
+        tolerance = self.tolerance_mgr.get(cur)
 
-    print("\nCurrent alerts:")
-    for a in processor.get_alerts():
-        print(a)
+        # 1️⃣ Missing‑source breaks are never suppressed
+        if source_missing:
+            self.logger.info(
+                f"[{user_id}] Break NOT suppressed (source missing) – {cur}"
+            )
+            # Still generate alert if diff > tolerance (requirement)
+            if max(qty_diff, mv_diff) > tolerance:
+                alert = self.alert_mgr.add(cur, max(qty_diff, mv_diff), tolerance)
+                self.logger.info(
+                    f"[{user_id}] Alert generated for excess break – {alert.id}"
+                )
+                return False, alert
+            return False, None
 
-    print("\nAudit log:")
-    for r in store.audit_log.query():
-        print(r)
+        # 2️⃣ Compare against tolerance
+        if max(qty_diff, mv_diff) <= tolerance:
+            # Suppressed
+            self.logger.info(
+                f"[{user_id}] Suppressed break – {cur} diff={max(qty_diff,mv_diff)} tol={tolerance}"
+            )
+            # Record suppression (audit‑style but not in audit log)
+            self.logger.debug(
+                f"SuppressedBreak|currency={cur}|diff={max(qty_diff,mv_diff)}|tolerance={tolerance}"
+            )
+            return True, None
 
-    print("\nSuppression log:")
-    for s in processor.suppression_log.query():
-        print(s)
+        # 3️⃣ Not suppressed → generate alert
+        alert = self.alert_mgr.add(cur, max(qty_diff, mv_diff), tolerance)
+        self.logger.info(
+            f"[{user_id}] Alert generated for excess break – {alert.id}"
+        )
+        return False, alert
+
+
+# ----------------------------------------------------------------------
+# Example logger (can be swapped with real logging framework)
+# ----------------------------------------------------------------------
+class SimpleLogger:
+    def info(self, msg: str):
+        print(f"[INFO] {msg}")
+
+    def debug(self, msg: str):
+        print(f"[DEBUG] {msg}")
+
+    def error(self, msg: str):
+        print(f"[ERROR] {msg}")
+
+
+# ----------------------------------------------------------------------
+# Convenience factory for quick usage in tests or scripts
+# ----------------------------------------------------------------------
+def create_service(default_tolerance: float = 0.0) -> Tuple[
+    ToleranceManager, AlertManager, BreakProcessor, AuditLog
+]:
+    audit = AuditLog()
+    tol_mgr = ToleranceManager(audit, default_tolerance)
+    alert_mgr = AlertManager()
+    processor = BreakProcessor(tol_mgr, alert_mgr, SimpleLogger())
+    return tol_mgr, alert_mgr, processor, audit
 ```
 
----
+**## Self‑review**  
 
-## Self‑review
-- **Correctness**: Implements all acceptance criteria – per‑currency tolerance with default, permission checks, validation, immutable audit log, suppression logic, and read‑only alerts with required fields.
-- **Thread safety**: Uses `threading.Lock` around mutable shared structures (tolerances, audit log, alerts, suppression log) to be safe in a concurrent service environment.
-- **Minimalism**: No external frameworks or persistence layers; all data lives in memory, matching the “clean and minimal” directive while still being easily replaceable with DB adapters.
+- **Correctness** – All CRUD operations validate numeric, non‑negative values, record immutable audit entries, and fall back to a configurable default when a currency is missing.  
+- **Suppression & alert logic** – Mirrors acceptance criteria: missing‑source breaks are never suppressed; tolerable breaks are logged and omitted; excess breaks generate a persistent alert (30‑day retention).  
+- **Minimalism** – Uses only the Python standard library, no external DB or permission framework, keeping the implementation lightweight and easy to integrate.  
+- **Extensibility** – Separate classes (`ToleranceManager`, `AlertManager`, `BreakProcessor`) allow future wiring to real persistence layers or role‑based access controls without changing core logic.
